@@ -109,7 +109,7 @@ static void search_fingerprint(const char* filename)
 		return;
 	}
 
-	j_res = fp_search_fingerprint_info(filename, 1);
+	j_res = fp_search_fingerprint_info((void*)filename, 1, FILE_PROCESS);
 	if(j_res == NULL) {
 		fprintf(stdout, "Could not find fingerprint info. filename[%s]\n", filename);
 		return;

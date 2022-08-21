@@ -7,6 +7,8 @@
 
 #define _GNU_SOURCE
 
+//  #define DEBUG_HANDLER
+
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -16,10 +18,17 @@
 #include <openssl/md5.h>
 #include <libgen.h>
 
+#include <byteswap.h>
+
 #include "slog.h"
 #include "db_ctx_handler.h"
 #include "fp_handler.h"
 #include "utils.h"
+
+// MES PROPRES MODIFS:
+#include "aubio_source_raw.h"
+#include "../../aubio/aubio-0.4.9/src/aubio_priv.h"
+
 
 db_ctx_t* g_db_ctx;
 
@@ -35,15 +44,22 @@ db_ctx_t* g_db_ctx;
 #define DEF_AUBIO_FILTER		40
 #define DEF_AUBIO_COEFS			13
 
+
+
+//#define CUSTOM_SOURCE
+#define WAV_SOURCE
+
+
 static bool init_database(void);
 
-static bool create_audio_list_info(const char* filename, const char* uuid);
-static bool create_audio_fingerprint_info(const char* filename, const char* uuid);
-static json_t* create_audio_fingerprints(const char* filename, const char* uuid);
+//  static bool create_audio_list_info(const char* filename, const char* uuid);
+//  static bool create_audio_fingerprint_info(const char* filename, const char* uuid);
+static json_t* create_audio_fingerprints(handler_audioBuffer_t * handler_buffer, const char* uuid);
+//static json_t* create_audio_fingerprints_from_raw_data(const audioBuffer_t * buf, const char* uuid);
 
 static json_t* get_audio_list_info(const char* uuid);
-static json_t* get_audio_list_info_by_hash(const char* hash);
-static char* create_file_hash(const char* filename);
+//  static json_t* get_audio_list_info_by_hash(const char* hash);
+//  static char* create_file_hash(const char* filename);
 
 static bool create_temp_search_table(const char* tablename);
 static bool delete_temp_search_table(const char* tablename);
@@ -83,88 +99,14 @@ bool fp_term(void)
 	return true;
 }
 
-bool fp_delete_fingerprint_info(const char* uuid)
+
+json_t* fp_search_fingerprint_info(handler_audioBuffer_t * handler_buffer)
 {
 	int ret;
-	json_t* j_tmp;
-	char* sql;
-
-	if(uuid == NULL) {
-		slog(LOG_WARNING, "Wrong input parameter.");
-		return false;
-	}
-
-	// get audio list info
-	j_tmp = get_audio_list_info(uuid);
-	if(j_tmp == NULL) {
-		slog(LOG_NOTICE, "Could not find audio list info.");
-		return false;
-	}
-
-	// delete audio list info
-	asprintf(&sql, "delete from audio_list where uuid='%s';", uuid);
-	ret = db_ctx_exec(g_db_ctx, sql);
-	sfree(sql);
-	if(ret == false) {
-		slog(LOG_WARNING, "Could not delete audio list info. uuid[%s]", uuid);
-		json_decref(j_tmp);
-		return false;
-	}
-
-	// delete audio fingerprint info
-	asprintf(&sql, "delete from audio_fingerprint where uuid='%s';", uuid);
-	ret = db_ctx_exec(g_db_ctx, sql);
-	sfree(sql);
-	if(ret == false) {
-		slog(LOG_WARNING, "Could not delete audio fingerprint info. uuid[%s]", uuid);
-		json_decref(j_tmp);
-		return false;
-	}
-
-	return true;
-}
-
-bool fp_craete_fingerprint_info(const char* filename)
-{
-	int ret;
-	char* uuid;
-
-	if(filename == NULL) {
-		slog(LOG_WARNING, "Wrong input parameter.");
-		return false;
-	}
-
-	// create uuid
-	uuid = utils_gen_uuid();
-
-	// create audio list info
-	ret = create_audio_list_info(filename, uuid);
-	if(ret == false) {
-		slog(LOG_NOTICE, "Could not create audio list info. May already exist.");
-		sfree(uuid);
-		return false;
-	}
-
-	// create audio fingerprint info
-	ret = create_audio_fingerprint_info(filename, uuid);
-	if(ret == false) {
-		slog(LOG_NOTICE, "Could not create audio fingerprint info.");
-
-		fp_delete_fingerprint_info(filename);
-		sfree(uuid);
-		return false;
-	}
-
-	return true;
-}
-
-json_t* fp_search_fingerprint_info(const char* filename, const int coefs)
-{
-	int ret;
-	char* uuid;
-	char* sql;
-	char* tmp;
-	char* tmp_max;
+	char* uuid = NULL;
+	char* sql = NULL;
+	char* tmp = NULL;
+	char* tmp_max = NULL;
 	char* tablename;
 	json_t* j_fprints;
 	json_t* j_tmp;
@@ -173,15 +115,10 @@ json_t* fp_search_fingerprint_info(const char* filename, const int coefs)
 	int idx;
 	int frame_count;
 	int i;
+	float tolerance = 0.0;
 
-	if(filename == NULL) {
+	if(handler_buffer == NULL) {
 		slog(LOG_WARNING, "Wrong input parameter.");
-		return NULL;
-	}
-	slog(LOG_DEBUG, "Fired fp_search_fingerprint_info. filename[%s]", filename);
-
-	if((coefs < 1) || (coefs > DEF_AUBIO_COEFS)) {
-		slog(LOG_WARNING, "Wrong coefs count. max[%d], coefs[%d]", DEF_AUBIO_COEFS, coefs);
 		return NULL;
 	}
 
@@ -202,7 +139,10 @@ json_t* fp_search_fingerprint_info(const char* filename, const int coefs)
 	}
 
 	// create fingerprint info
-	j_fprints = create_audio_fingerprints(filename, uuid);
+	j_fprints = create_audio_fingerprints(handler_buffer, uuid);
+
+
+
 	sfree(uuid);
 	if(j_fprints == NULL) {
 		slog(LOG_ERR, "Could not create fingerprint info.");
@@ -211,29 +151,27 @@ json_t* fp_search_fingerprint_info(const char* filename, const int coefs)
 		return NULL;
 	}
 
+	tolerance = (handler_buffer->conf.tolerance == 0) ? DEF_SEARCH_TOLERANCE : handler_buffer->conf.tolerance;
+
 	// search
 	frame_count = json_array_size(j_fprints);
 	json_array_foreach(j_fprints, idx, j_tmp) {
-		asprintf(&sql, "insert into %s select * from audio_fingerprint where "
-				"max1 >= %f and max1 <= %f",
-				tablename,
-				json_real_value(json_object_get(j_tmp, "max1")) - DEF_SEARCH_TOLERANCE,
-				json_real_value(json_object_get(j_tmp, "max1")) + DEF_SEARCH_TOLERANCE
-				);
+		
+		asprintf(&sql, "insert into %s select * from audio_fingerprint where", tablename);
+		for (i = 0 ; i < handler_buffer->conf.nb_coef ; i++)
+		{
+			asprintf(&tmp_max, "max%u", handler_buffer->conf.mfcc_coefs[i]);	
 
-		// add more conditions if the more coefs has given.
-		for(i = 1; i < coefs; i++) {
-			asprintf(&tmp_max, "max%d", i + 1);
+			asprintf(&tmp, "%s (%s >= %f and %s <= %f)",
+					 sql,
+					 tmp_max,
+					 json_real_value(json_object_get(j_tmp, tmp_max)) - tolerance,
+					 tmp_max,
+					 json_real_value(json_object_get(j_tmp, tmp_max)) + tolerance);
 
-			asprintf(&tmp, "%s and %s >= %f and %s <= %f",
-					sql,
+			if (i < handler_buffer->conf.nb_coef-1)
+				asprintf(&tmp, "%s or", tmp);
 
-					tmp_max,
-					json_real_value(json_object_get(j_tmp, tmp_max)) - DEF_SEARCH_TOLERANCE,
-
-					tmp_max,
-					json_real_value(json_object_get(j_tmp, tmp_max)) + DEF_SEARCH_TOLERANCE
-					);
 			sfree(tmp_max);
 			sfree(sql);
 			sql = tmp;
@@ -243,8 +181,10 @@ json_t* fp_search_fingerprint_info(const char* filename, const int coefs)
 		sfree(sql);
 		sql = tmp;
 
+
 		db_ctx_exec(g_db_ctx, sql);
 		sfree(sql);
+
 	}
 	json_decref(j_fprints);
 
@@ -316,112 +256,30 @@ json_t* fp_get_fingerprint_lists_all(void)
 	return j_res;
 }
 
-/**
- * Create audio list data and insert it.
- * If the file is already listed, return false.
- * @param filename
- * @param uuid
- * @return
- */
-static bool create_audio_list_info(const char* filename, const char* uuid)
+
+static unsigned int copy_audioBuffer_into_regularBuffer(const handler_audioBuffer_t handler, smpl_t *buf_out)
 {
-	int ret;
-	char* hash;
-	char* tmp;
-	const char* name;
-	json_t* j_tmp;
-
-	if((filename == NULL) || (uuid == NULL)) {
-		slog(LOG_WARNING, "Wrong input parameter.");
-		return false;
-	}
-	slog(LOG_DEBUG, "Fired create_audio_list_info. filename[%s], uuid[%s]", filename, uuid);
-
-	// create file hash
-	hash = create_file_hash(filename);
-	if(hash == NULL) {
-		slog(LOG_WARNING, "Could not create hash info.");
-		return false;
-	}
-	slog(LOG_DEBUG, "Created hash. hash[%s]", hash);
-
-	// check existence
-	j_tmp = get_audio_list_info_by_hash(hash);
-	if(j_tmp != NULL) {
-		slog(LOG_NOTICE, "The given file is already inserted.");
-		sfree(hash);
-		return false;
-	}
-
-	// craete data
-	tmp = strdup(filename);
-	name = basename(tmp);
-	sfree(tmp);
-	j_tmp = json_pack("{s:s, s:s, s:s}",
-			"uuid", 	uuid,
-			"name",		name,
-			"hash",		hash
-			);
-	sfree(hash);
-
-	// insert
-	ret = db_ctx_insert(g_db_ctx, "audio_list", j_tmp);
-	json_decref(j_tmp);
-	if(ret == false) {
-		slog(LOG_ERR, "Could not create fingerprint info.");
-		return false;
-	}
-
-	return true;
-}
-
-/**
- * Create audio fingerprint data and insert it.
- * @param filename
- * @param uuid
- * @return
- */
-static bool create_audio_fingerprint_info(const char* filename, const char* uuid)
-{
-	int ret;
-	int idx;
-	json_t* j_fprint;
-	json_t* j_fprints;
-
-	if((filename == NULL) || (uuid == NULL)) {
-		slog(LOG_WARNING, "Wrong input parameter.");
-		return false;
-	}
-	slog(LOG_DEBUG, "Fired create_audio_fingerprint_info. filename[%s], uuid[%s]", filename, uuid);
-
-	// craete fingerprint data
-	j_fprints = create_audio_fingerprints(filename, uuid);
-	if(j_fprints == NULL) {
-		slog(LOG_ERR, "Could not create fingerprint data.");
-		return false;
-	}
-
-	// insert data
-	json_array_foreach(j_fprints, idx, j_fprint) {
-		ret = db_ctx_insert(g_db_ctx, "audio_fingerprint", j_fprint);
-		if(ret == false) {
-			slog(LOG_WARNING, "Could not insert fingerprint data.");
-			continue;
+	unsigned int size = 0;
+	
+	for (int i = 0 ; i < handler.conf.max_frames ; i++)
+	{
+		for (int j = 0 ; j < handler.conf.max_frame_size ; j++)
+		{
+			buf_out[i*handler.conf.max_frame_size + j] = ((smpl_t)handler.buffer.frames[i].data_time[j])/32767;
 		}
+		size += handler.conf.max_frame_size;
 	}
-	json_decref(j_fprints);
-
-	return true;
+	return size;
 }
 
-static json_t* create_audio_fingerprints(const char* filename, const char* uuid)
+static json_t* create_audio_fingerprints(handler_audioBuffer_t* handler_buffer, const char* uuid)
 {
 	json_t* j_res;
 	json_t* j_tmp;
-	unsigned int reads;
+	unsigned int reads  = 0;
 	int count;
 	int samplerate;
-	char* source;
+	int hop_size;
 	char* tmp;
 	int i;
 
@@ -433,16 +291,22 @@ static json_t* create_audio_fingerprints(const char* filename, const char* uuid)
 
 	aubio_source_t* aubio_src;
 
-	if((filename == NULL) || (uuid == NULL)) {
-		fprintf(stderr, "Wrong input parameter.\n");
-		return NULL;
-	}
-	slog(LOG_DEBUG, "Fired create_audio_fingerprints. filename[%s], uuid[%s]", filename, uuid);
+	samplerate = 44100;
+	hop_size = handler_buffer->conf.max_frame_size * sizeof(short); 	// FRAME_POINTS = 2048, SIZE_POINT = 2
+	aubio_source_raw_data_t * aubio_raw_data = AUBIO_NEW(aubio_source_raw_data_t);
 
-	// initiate aubio src
-	source = strdup(filename);
-	aubio_src = new_aubio_source(source, DEF_AUBIO_SAMPLERATE, DEF_AUBIO_HOPSIZE);
-	sfree(source);
+	aubio_raw_data->buffer = (smpl_t*)malloc(sizeof(smpl_t) * handler_buffer->conf.max_frames * handler_buffer->conf.max_frame_size);
+
+	aubio_raw_data->size_buffer = copy_audioBuffer_into_regularBuffer(*handler_buffer, aubio_raw_data->buffer);
+	aubio_raw_data->size_point = sizeof(smpl_t);
+
+
+	aubio_raw_data->samplerate = samplerate;
+	aubio_raw_data->nb_channels = 1;
+	aubio_src = new_aubio_source_raw(aubio_raw_data, samplerate, hop_size);
+
+
+//	sfree(source);
 	if(aubio_src == NULL) {
 		slog(LOG_ERR, "Could not initiate aubio src.");
 		return NULL;
@@ -470,6 +334,7 @@ static json_t* create_audio_fingerprints(const char* filename, const char* uuid)
 	j_res = json_array();
 	count = 0;
 	while(1) {
+
 		aubio_source_do(aubio_src, mfcc_buf, &reads);
 		if(reads == 0) {
 		  break;
@@ -480,12 +345,13 @@ static json_t* create_audio_fingerprints(const char* filename, const char* uuid)
 
 		// compute mfcc
 		aubio_mfcc_do(mfcc, fftgrain, mfcc_out);
-
+		
 		// create mfcc data
 		j_tmp = json_pack("{s:i, s:s}",
 				"frame_idx",	count,
 				"audio_uuid",	uuid
 				);
+
 		for(i = 0; i < DEF_AUBIO_COEFS; i++) {
 			asprintf(&tmp, "max%d", i + 1);
 			json_object_set_new(j_tmp, tmp, json_real(10 * log10(fabs(mfcc_out->data[i]))));
@@ -500,6 +366,7 @@ static json_t* create_audio_fingerprints(const char* filename, const char* uuid)
 		json_array_append_new(j_res, j_tmp);
 		count++;
 	}
+
 
 	del_aubio_pvoc(pv);
 	del_cvec(fftgrain);
@@ -568,77 +435,7 @@ static bool init_database(void)
 	return true;
 }
 
-static char* create_file_hash(const char* filename)
-{
-	unsigned char hash[MD5_DIGEST_LENGTH];
-	int i;
-	FILE* file;
-	MD5_CTX md_ctx;
-	int read;
-	unsigned char data[1024];
-	char* res;
-	char* tmp;
 
-	if(filename == NULL) {
-		slog(LOG_WARNING, "Wrong input parameter.");
-		return NULL;
-	}
-
-	file = fopen (filename, "rb");
-	if(file == NULL) {
-		slog(LOG_WARNING, "Could not open file. filename[%s]", filename);
-		return NULL;
-	}
-
-	// create hash info
-	MD5_Init (&md_ctx);
-	while(1) {
-		read = fread(data, 1, sizeof(data), file);
-		if(read == 0) {
-			break;
-		}
-		MD5_Update(&md_ctx, data, read);
-	}
-	fclose(file);
-
-	// make hash
-	MD5_Final(hash, &md_ctx);
-
-	// create result
-	tmp = NULL;
-	res = NULL;
-    for(i = 0; i < MD5_DIGEST_LENGTH; i++) {
-    	asprintf(&tmp, "%s%02x", res? : "", hash[i]);
-    	sfree(res);
-    	res = strdup(tmp);
-    	sfree(tmp);
-    }
-
-	return res;
-}
-
-static json_t* get_audio_list_info_by_hash(const char* hash)
-{
-	char* sql;
-	json_t* j_res;
-
-	if(hash == NULL) {
-		slog(LOG_WARNING, "Wrong input parameter.");
-		return NULL;
-	}
-
-	asprintf(&sql, "select * from audio_list where hash = '%s';", hash);
-	db_ctx_query(g_db_ctx, sql);
-	sfree(sql);
-
-	j_res = db_ctx_get_record(g_db_ctx);
-	db_ctx_free(g_db_ctx);
-	if(j_res == NULL) {
-		return NULL;
-	}
-
-	return j_res;
-}
 
 static json_t* get_audio_list_info(const char* uuid)
 {
@@ -718,3 +515,4 @@ static bool delete_temp_search_table(const char* tablename)
 
 	return true;
 }
+
